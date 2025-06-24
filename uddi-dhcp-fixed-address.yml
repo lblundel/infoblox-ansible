@@ -1,0 +1,37 @@
+- hosts: nios_x
+  gather_facts: yes
+  module_defaults:
+    group/infoblox.universal_ddi.all:
+      portal_url: "{{ vaulted_portal_url }}"
+      portal_key: "{{ vaulted_portal_key }}"
+  tasks:
+
+# create a fixed address for the host in Infoblox
+    - name: get host IP address
+      debug:
+        var: ansible_default_ipv4.address
+      
+    - name: get host MAC address
+      debug:
+        var: ansible_default_ipv4.macaddress
+
+    - name: Get IP Space information by filters (e.g. name)
+      infoblox.universal_ddi.ipam_ip_space_info:
+        filters:
+          name: "{{ uddi_ip_space_name }}"
+      register: _ip_space_info
+      delegate_to: localhost
+
+    - name: debug ip_space_info id
+      debug:
+        var: _ip_space_info.objects.0.id
+  
+    - name: Create a Fixed Address
+      infoblox.universal_ddi.dhcp_fixed_address:
+        address: "{{ ansible_default_ipv4.address}}"
+        name: "{{ ansible_fqdn }}"
+        match_type: "mac"
+        match_value: "{{ ansible_default_ipv4.macaddress }}"
+        ip_space: "{{ _ip_space_info.objects.0.id }}"
+        state: "present"
+      delegate_to: localhost

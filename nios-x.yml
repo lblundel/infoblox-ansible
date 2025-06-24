@@ -1,0 +1,264 @@
+---
+- name: Setup NIOS-X on Ubuntu 22.04
+  hosts: nios_x
+  become: yes
+  gather_facts: yes
+  module_defaults:
+    group/infoblox.universal_ddi.all:
+      portal_url: "{{ vaulted_portal_url }}"
+      portal_key: "{{ vaulted_portal_key }}"
+  vars:
+      join_token: "{{ vaulted_join_token }}"
+  tasks:
+
+# create a fixed address for the host in Infoblox
+    - name: get host IP address
+      debug:
+        var: ansible_default_ipv4.address
+      
+    - name: get host MAC address
+      debug:
+        var: ansible_default_ipv4.macaddress
+
+    - name: Get IP Space information by filters (e.g. name)
+      infoblox.universal_ddi.ipam_ip_space_info:
+        filters:
+          name: "{{ uddi_ip_space_name }}"
+      register: _ip_space_info
+      delegate_to: localhost
+
+    - name: debug ip_space_info id
+      debug:
+        var: _ip_space_info.objects.0.id
+  
+    - name: Create a Fixed Address
+      infoblox.universal_ddi.dhcp_fixed_address:
+        address: "{{ ansible_default_ipv4.address}}"
+        name: "{{ ansible_fqdn }}"
+        match_type: "mac"
+        match_value: "{{ ansible_default_ipv4.macaddress }}"
+        ip_space: "{{ _ip_space_info.objects.0.id }}"
+        state: "present"
+        tags: "{{ uddi_tags }}"
+      delegate_to: localhost
+
+# Prepare the OS
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Install net-tools and dnsutils
+      apt:
+        name:
+          - net-tools
+          - dnsutils
+        state: present
+
+    - name: Install ca-certificates and curl
+      apt:
+        name:
+          - ca-certificates
+          - curl
+        state: present
+
+    - name: Ensure /etc/apt/keyrings directory exists
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Download Docker GPG key
+      get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        mode: '0644'
+        force: yes
+
+    - name: Add Docker repository
+      apt_repository:
+        repo: "deb [arch={{ ansible_architecture | replace('x86_64','amd64') }} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu {{ ansible_lsb.codename }} stable"
+        filename: docker
+        state: present
+
+    - name: Install containerd.io
+      apt:
+        name: containerd.io
+        state: present
+        update_cache: yes
+
+    - name: Disable systemd-resolved service
+      systemd:
+        name: systemd-resolved
+        enabled: no
+
+    - name: Stop systemd-resolved service
+      systemd:
+        name: systemd-resolved
+        state: stopped
+
+    - name: Set up resolver with Google DNS
+      copy:
+        dest: /etc/resolv.conf
+        content: |
+          nameserver 8.8.8.8
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Reboot system
+
+    - name: Stop NetworkManager-wait-online service if present
+      systemd:
+        name: NetworkManager-wait-online.service
+        state: stopped
+        enabled: no
+      ignore_errors: yes
+
+    - name: Stop NetworkManager-dispatcher service if present
+      systemd:
+        name: NetworkManager-dispatcher.service
+        state: stopped
+        enabled: no
+      ignore_errors: yes
+
+    - name: Stop network-manager service if present
+      systemd:
+        name: network-manager.service
+        state: stopped
+        enabled: no
+      ignore_errors: yes
+
+    - name: Reconfigure unattended-upgrades
+      # command: dpkg-reconfigure -f noninteractive unattended-upgrades
+      copy:
+        dest: /etc/apt/apt.conf.d/20auto-upgrades
+        content: |
+          APT::Periodic::Update-Package-Lists "0";
+          APT::Periodic::Unattended-Upgrade "0";
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Reboot system
+      become: yes
+
+    - name: Configure inotify limits for Kubernetes
+      copy:
+        dest: /etc/sysctl.d/99-kubernetes-cri.conf
+        content: |
+          fs.inotify.max_user_instances = 8192
+          fs.inotify.max_user_watches = 524288
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Reboot system
+
+    - name: Reload sysctl to apply new inotify limits
+      command: sysctl --system
+      become: yes
+
+    - name: Install iptables
+      package:
+        name: iptables
+        state: present
+        enabled: yes
+        running: yes
+      ignore_errors: yes
+
+    - name: Stop firewalld service if present
+      systemd:
+        name: firewalld.service
+        state: stopped
+        enabled: no
+        masked: yes
+      ignore_errors: yes
+
+    - name: Enable iptables service
+      systemd:
+        name: iptables
+        enabled: yes
+      ignore_errors: yes
+
+    - name: Load ipv6 kernel module
+      modprobe:
+        name: ipv6
+        state: present
+      ignore_errors: yes
+
+    - name: Load ip6_tables kernel module
+      modprobe:
+        name: ip6_tables
+        state: present
+      ignore_errors: yes
+
+    - name: Start iptables service
+      systemd:
+        name: iptables
+        state: started
+      ignore_errors: yes
+
+    - name: Check status of firewalld service
+      command: systemctl status firewalld.service
+      register: firewalld_status
+      ignore_errors: yes
+
+    - name: Check status of iptables service
+      command: systemctl status iptables
+      register: iptables_status
+      ignore_errors: yes
+
+    - name: Set GRUB_CMDLINE_LINUX for unified cgroup hierarchy
+      lineinfile:
+        path: /etc/default/grub
+        regexp: '^GRUB_CMDLINE_LINUX='
+        line: 'GRUB_CMDLINE_LINUX="systemd.unified_cgroup_hierarchy=no"'
+        backrefs: yes
+      notify: Reboot system
+
+    - name: Update grub configuration
+      command: update-grub
+      become: yes
+      notify: Reboot system
+
+    - name: Set iptables to iptables-legacy
+      command: update-alternatives --set iptables /usr/sbin/iptables-legacy
+      become: yes
+      ignore_errors: yes
+      notify: Reboot system
+
+    - name: Set ip6tables to ip6tables-legacy
+      command: update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy
+      become: yes
+      ignore_errors: yes
+      notify: Reboot system
+
+    - name: Flush handlers
+      meta: flush_handlers
+
+# download and run NIOS-X install script
+    - name: Download NIOS-X install script
+      get_url:
+        url: https://s3.amazonaws.com/ib-noa-prod.csp.infoblox.com/bloxone_installer_v2.0.0.sh
+        dest: /tmp/bloxone_installer.sh
+        mode: '0755'
+        force: yes
+
+    - name: Run NIOS-X install script
+      command: /tmp/bloxone_installer.sh -j "{{ join_token }}"
+      args:
+        chdir: /tmp
+      register: nios_x_install_output
+
+    - name: Display NIOS-X installation output
+      debug:
+        var: nios_x_install_output.stdout_lines
+
+
+
+# create a handler to reboot the system
+  handlers:
+    - name: Reboot system
+      reboot:
+        msg: "Rebooting after NIOS-X setup"
+        connect_timeout: 5
+        reboot_timeout: 600
+      when: ansible_facts['os_family'] == 'Debian'
+      ignore_errors: yes

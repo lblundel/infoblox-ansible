@@ -1,0 +1,41 @@
+- hosts: localhost
+  gather_facts: no
+  module_defaults:
+    group/infoblox.universal_ddi.all:
+      portal_url: "{{ vaulted_portal_url }}"
+      portal_key: "{{ vaulted_portal_key }}"
+  tasks:
+
+# create a DNS A record in Infoblox UDDI
+    - name: Get DNS View information by filters (e.g. name)
+      infoblox.universal_ddi.dns_view_info:
+        filters:
+          name: "{{ uddi_dns_view }}"
+      register: _dns_view_info
+      delegate_to: localhost
+
+    - name: debug _dns_view_info id
+      debug:
+        var: _dns_view_info.objects.0.id
+
+    - name: Get DNS Auth Zone information by filters (e.g. name)
+      infoblox.universal_ddi.dns_auth_zone_info:
+        filters:
+          fqdn: "{{ uddi_auth_zone_fqdn }}"
+          view: "{{ _dns_view_info.objects.0.id }}"
+      register: _dns_auth_zone_info
+      delegate_to: localhost
+
+    - name: debug _dns_auth_zone_info id
+      debug:
+        var: _dns_auth_zone_info.objects.0.id
+
+    - name: Create a DNS record in Infoblox UDDI
+      infoblox.universal_ddi.dns_record:
+        zone: "{{ _dns_auth_zone_info.objects.0.id }}"
+        rdata:
+            address: "192.168.0.254"
+        name_in_zone: "ansible-test"
+        type: "A"
+        state: absent
+      delegate_to: localhost
